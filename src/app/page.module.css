@@ -2,4 +2,14 @@
   position: relative;
   width: 100vw;
   height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background-color: #1a1a1a;
+}
+.title {
+  color: white;
+  font-size: 5rem;
+  z-index: 1; /* Ensure text is on top of the canvas */
 }
