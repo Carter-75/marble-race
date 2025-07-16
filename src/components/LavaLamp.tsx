@@ -6,6 +6,20 @@ import 'pathseg';
 import anime from 'animejs';
 const decomp = require('poly-decomp');
 
+function debounce<F extends (...args: any[]) => any>(func: F, waitFor: number) {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+
+  const debounced = (...args: Parameters<F>) => {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+      timeout = null;
+    }
+    timeout = setTimeout(() => func(...args), waitFor);
+  };
+
+  return debounced;
+}
+
 
 const MAX_METABALLS = 1000000; 
 
@@ -117,7 +131,57 @@ const fragmentShaderSource = `
 
 type CameraMode = 'disabled' | 'winner' | 'mass' | 'loser';
 
+const MARBLE_CATEGORY = 0x0001;
+const WORLD_CATEGORY = 0x0002;
+const SPINNER_CATEGORY = 0x0004;
+const DYNAMIC_OBSTACLE_CATEGORY = 0x0008;
+
 const LavaLamp: React.FC = () => {
+  const [dimensions, setDimensions] = useState({
+    width: typeof window !== 'undefined' ? window.innerWidth : 0,
+    height: typeof window !== 'undefined' ? window.innerHeight : 0,
+  });
+  const engineRef = useRef<Matter.Engine | null>(null);
+  const renderRef = useRef<Matter.Render | null>(null);
+  const glRef = useRef<WebGLRenderingContext | null>(null);
+  const glProgramDataRef = useRef<{
+      program: WebGLProgram;
+      uniforms: { [key: string]: WebGLUniformLocation | null };
+      positionBuffer: WebGLBuffer | null;
+      metaballTexture: WebGLTexture | null;
+      textureWidth: number;
+      textureHeight: number;
+  } | null>(null);
+  const worldObjectsRef = useRef<{
+      worldComposite: Matter.Composite,
+      conveyorBelts: { body: Matter.Body, speed: number }[],
+      oscillatingPegs: { body: Matter.Body, initialPos: Matter.Vector, amplitude: Matter.Vector, frequency: number }[],
+      animatedCradles: { firstBob: Matter.Body, lastActivation: number, interval: number }[],
+      allWindZones: { body: Matter.Body, indicator: Matter.Body, force: Matter.Vector }[],
+      existingObstacles: Matter.Body[],
+      finishAreaStartY: number,
+      finalPlatformY: number,
+  } | null>(null);
+
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    
+    const debouncedHandleResize = debounce(() => {
+      setDimensions({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+    }, 200);
+
+    window.addEventListener('resize', debouncedHandleResize);
+    return () => {
+      window.removeEventListener('resize', debouncedHandleResize);
+    };
+  }, []);
+
   const [speedMultiplier, setSpeedMultiplier] = useState(1);
   const speedMultiplierRef = useRef(speedMultiplier);
   speedMultiplierRef.current = speedMultiplier;
@@ -147,502 +211,432 @@ const LavaLamp: React.FC = () => {
 
     let animationFrameId: number;
     const { Engine, Render, World, Bodies, Composite, Constraint, Body, Common, Query, Sleeping } = Matter;
-    Common.setDecomp(decomp);
-    const engine = Engine.create();
-    engine.world.gravity.y = 1;
-    engine.enableSleeping = true;
-    engine.positionIterations = 10;
-    engine.velocityIterations = 8;
-    engine.constraintIterations = 5; // Increased for more stability
-    (engine as any).ccdEnabled = true;
+    type WindZoneController = { body: Matter.Body; indicator: Matter.Body; force: Matter.Vector; };
 
-    const courseLengthMultiplier = 3; // Shortened again for more compact layers
+    // --- ONE-TIME INITIALIZATION ---
+    if (!engineRef.current) {
+        // --- Matter.js Engine and Renderer ---
+        Common.setDecomp(decomp);
+        const engine = Engine.create();
+        engine.world.gravity.y = 1;
+        engine.enableSleeping = true;
+        engine.positionIterations = 10;
+        engine.velocityIterations = 8;
+        engine.constraintIterations = 5;
+        (engine as any).ccdEnabled = true;
+        engineRef.current = engine;
+        
+        const render = Render.create({
+            canvas: matterCanvas,
+            engine: engine,
+            options: {
+                width: dimensions.width,
+                height: dimensions.height,
+                wireframes: false,
+                background: 'transparent',
+            },
+        });
+        renderRef.current = render;
 
-    // --- Types and Categories ---
-    type WindZoneController = {
-      body: Matter.Body;
-      indicator: Matter.Body;
-      force: Matter.Vector;
-    };
-    const MARBLE_CATEGORY = 0x0001;
-    const WORLD_CATEGORY = 0x0002;
-    const SPINNER_CATEGORY = 0x0004;
-    const DYNAMIC_OBSTACLE_CATEGORY = 0x0008;
-
-    const render = Render.create({
-      canvas: matterCanvas,
-      engine: engine,
-      options: {
-        width: window.innerWidth,
-        height: window.innerHeight,
-        wireframes: false,
-        background: 'transparent',
-      },
-    });
-    
-    const gl = metaballCanvas.getContext('webgl');
-    if (!gl) {
-      console.error("WebGL not supported");
-      return;
-    }
-    
+        // --- WebGL Context and Program ---
+        const gl = metaballCanvas.getContext('webgl');
+        if (gl) {
+            glRef.current = gl;
     const floatTextureExt = gl.getExtension('OES_texture_float');
-    if (!floatTextureExt) {
-      console.error("Floating point textures not supported");
-      return;
-    }
-
+            if (floatTextureExt) {
     const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
     const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-    if (!vertexShader || !fragmentShader) return;
-
+                if (vertexShader && fragmentShader) {
     const program = createProgram(gl, vertexShader, fragmentShader);
-    if (!program) return;
+                    if (program) {
+                        const textureWidth = 1000;
+                        const textureHeight = 1000;
+                        const metaballTexture = gl.createTexture();
+                        gl.bindTexture(gl.TEXTURE_2D, metaballTexture);
+                        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, null);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    const uniforms = {
+                        glProgramDataRef.current = {
+                            program,
+                            uniforms: {
       positionAttributeLocation: gl.getAttribLocation(program, "a_position"),
       resolutionUniformLocation: gl.getUniformLocation(program, "u_resolution"),
       metaballsTextureLocation: gl.getUniformLocation(program, "u_metaball_texture"),
       textureDimensionsUniformLocation: gl.getUniformLocation(program, "u_texture_dimensions"),
       numMetaballsUniformLocation: gl.getUniformLocation(program, "u_num_metaballs"),
       timeUniformLocation: gl.getUniformLocation(program, "u_time"),
+                            },
+                            positionBuffer: gl.createBuffer(),
+                            metaballTexture: metaballTexture,
+                            textureWidth,
+                            textureHeight,
     };
-
-    const positionBuffer = gl.createBuffer();
+                        const positionBuffer = glProgramDataRef.current.positionBuffer;
     gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
     const positions = [-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1];
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
-
-    const metaballTexture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, metaballTexture);
-    const textureWidth = 1000;
-    const textureHeight = 1000;
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-    const zoom = 1.5; // Centralized zoom factor
-    const viewWidth = window.innerWidth * zoom;
-    const wallXOffset = (viewWidth - window.innerWidth) / 2;
-
-    // --- Create Ramps & Spikes Iteratively with Varied Heights ---
-    const ramps = [];
-    const rampWidth = 200;
-    const numRampSets = 10 * courseLengthMultiplier;
-    let currentCourseY = 500; // Start Y position
-
-    for (let i = 0; i < numRampSets; i++) {
-        // --- Create a main ramp with varied height ---
-        const currentRampHeight = 400 + Math.random() * 800; // Ramp height is varied
-        const rampY = currentCourseY + currentRampHeight / 2;
-        const isLeft = Math.random() > 0.5;
-
-        let ramp;
-        if (isLeft) {
-            const x = -wallXOffset + rampWidth / 3;
-            ramp = Bodies.fromVertices(x, rampY, [[{ x: 0, y: -currentRampHeight / 2 }, { x: rampWidth, y: 0 }, { x: 0, y: currentRampHeight / 2 }]], {
-                isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
-            });
-        } else {
-            const x = window.innerWidth + wallXOffset - rampWidth / 3;
-            ramp = Bodies.fromVertices(x, rampY, [[{ x: rampWidth, y: -currentRampHeight / 2 }, { x: 0, y: 0 }, { x: rampWidth, y: currentRampHeight / 2 }]], {
-                isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
-            });
+                    }
+                }
+            }
         }
-        ramps.push(ramp);
+        
+        // --- World Generation ---
+        
 
-        // --- Fill the gap below with a varied set of spikes ---
-        const gapHeight = 200 + Math.random() * 600; // The height of the entire spike set is varied
-        const gapStartY = rampY + currentRampHeight / 2;
-        const spikeHeightForSet = 30 + Math.random() * 50;
+        const courseLengthMultiplier = 3;
+        const zoom = 1.5;
+        const viewWidth = dimensions.width * zoom;
+        const wallXOffset = (viewWidth - dimensions.width) / 2;
+        
+        const ramps = [];
+        const rampWidth = 200;
+        const numRampSets = 10 * courseLengthMultiplier;
+        let currentCourseY = 500;
 
-        for (let spikeY = gapStartY; spikeY < gapStartY + gapHeight; spikeY += spikeHeightForSet) {
-            const spikeLength = 100 + Math.random() * 150;
-            const spikeOptions = {
-                isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
-            };
-            let spike;
-            if (!isLeft) {
-                const x = -wallXOffset + 10;
-                spike = Bodies.fromVertices(x, spikeY + spikeHeightForSet / 2, [[
-                    { x: -spikeLength, y: -spikeHeightForSet / 2 }, { x: spikeLength, y: 0 }, { x: -spikeLength, y: spikeHeightForSet / 2 }
-                ]], spikeOptions);
+        for (let i = 0; i < numRampSets; i++) {
+            const currentRampHeight = 400 + Math.random() * 800;
+            const rampY = currentCourseY + currentRampHeight / 2;
+            const isLeft = Math.random() > 0.5;
+            let ramp;
+            if (isLeft) {
+                const x = -wallXOffset + rampWidth / 3;
+                ramp = Bodies.fromVertices(x, rampY, [[{ x: 0, y: -currentRampHeight / 2 }, { x: rampWidth, y: 0 }, { x: 0, y: currentRampHeight / 2 }]], {
+                    isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
+                });
             } else {
-                const x = window.innerWidth + wallXOffset - 10;
-                spike = Bodies.fromVertices(x, spikeY + spikeHeightForSet / 2, [[
-                    { x: spikeLength, y: -spikeHeightForSet / 2 }, { x: -spikeLength, y: 0 }, { x: spikeLength, y: spikeHeightForSet / 2 }
-                ]], spikeOptions);
+                const x = dimensions.width + wallXOffset - rampWidth / 3;
+                ramp = Bodies.fromVertices(x, rampY, [[{ x: rampWidth, y: -currentRampHeight / 2 }, { x: 0, y: 0 }, { x: rampWidth, y: currentRampHeight / 2 }]], {
+                    isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
+                });
             }
-            ramps.push(spike);
+            ramps.push(ramp);
+            const gapHeight = 200 + Math.random() * 600;
+            const gapStartY = rampY + currentRampHeight / 2;
+            const spikeHeightForSet = 30 + Math.random() * 50;
+            for (let spikeY = gapStartY; spikeY < gapStartY + gapHeight; spikeY += spikeHeightForSet) {
+                const spikeLength = 100 + Math.random() * 150;
+                const spikeOptions = { isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
+                let spike;
+                if (!isLeft) {
+                    const x = -wallXOffset + 10;
+                    spike = Bodies.fromVertices(x, spikeY + spikeHeightForSet / 2, [[{ x: -spikeLength, y: -spikeHeightForSet / 2 }, { x: spikeLength, y: 0 }, { x: -spikeLength, y: spikeHeightForSet / 2 }]], spikeOptions);
+                } else {
+                    const x = dimensions.width + wallXOffset - 10;
+                    spike = Bodies.fromVertices(x, spikeY + spikeHeightForSet / 2, [[{ x: spikeLength, y: -spikeHeightForSet / 2 }, { x: -spikeLength, y: 0 }, { x: spikeLength, y: spikeHeightForSet / 2 }]], spikeOptions);
+                }
+                ramps.push(spike);
+            }
+            currentCourseY = gapStartY + gapHeight;
         }
-        currentCourseY = gapStartY + gapHeight;
+
+        const finishAreaStartY = currentCourseY + 100;
+        const finishPlatforms: Matter.Body[] = [];
+        const finishOptions = { isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
+        let y = finishAreaStartY + 100;
+        const verticalSpacing = 250;
+        const numPlatforms = 6;
+        const platformWidth = viewWidth * 0.9;
+        for (let i = 0; i < numPlatforms; i++) {
+            const angle = 0.15;
+            let x;
+            let effectiveAngle;
+            if (i % 2 === 0) {
+                x = -wallXOffset + platformWidth / 2 - 50;
+                effectiveAngle = angle;
+            } else {
+                x = dimensions.width + wallXOffset - platformWidth / 2 + 50;
+                effectiveAngle = -angle;
+            }
+            finishPlatforms.push(Bodies.rectangle(x, y, platformWidth, 20, { ...finishOptions, angle: effectiveAngle }));
+            y += verticalSpacing;
+        }
+
+        const secondToLastPlatform = finishPlatforms[finishPlatforms.length - 1];
+        const vertices = secondToLastPlatform.vertices;
+        const leftMostVertex = [...vertices].sort((a, b) => a.x - b.x)[0];
+        const finishWallHeight = 60;
+        const finishWallWidth = 20;
+        const wall = Bodies.rectangle(leftMostVertex.x + (finishWallWidth / 2), leftMostVertex.y - (finishWallHeight / 2) + 10, finishWallWidth, finishWallHeight, finishOptions);
+        finishPlatforms.push(wall);
+
+        const finalPlatformY = y + 100;
+        const finalPlatform = Bodies.rectangle(dimensions.width / 2, finalPlatformY, viewWidth, 20, finishOptions);
+        finishPlatforms.push(finalPlatform);
+
+        const wallHeight = finalPlatformY + 100;
+        const wallOptions = { isStatic: true, render: { visible: false }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
+        const leftWall = Bodies.rectangle(-wallXOffset - 50, wallHeight / 2, 100, wallHeight, wallOptions);
+        const rightWall = Bodies.rectangle(dimensions.width + wallXOffset + 50, wallHeight / 2, 100, wallHeight, wallOptions);
+        const borderHeight = wallHeight;
+        const borderOptions = { isStatic: true, render: { fillStyle: 'red' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
+        const leftBorder = Bodies.rectangle(-wallXOffset, borderHeight / 2, 2, borderHeight, borderOptions);
+        const rightBorder = Bodies.rectangle(dimensions.width + wallXOffset, borderHeight / 2, 2, borderHeight, borderOptions);
+
+        const rect = Bodies.rectangle(dimensions.width / 2, 200, 400, 10, {
+            isStatic: false, density: 0.00001, friction: 0, frictionAir: 0,
+            render: { fillStyle: 'white' },
+            collisionFilter: { category: SPINNER_CATEGORY, mask: MARBLE_CATEGORY }
+        });
+        const rectConstraint = Constraint.create({ pointA: { x: dimensions.width / 2, y: 200 }, bodyB: rect, stiffness: 1, length: 0 });
+
+        const layeredObstacles: (Matter.Body | Matter.Constraint)[] = [];
+        const conveyorBelts: { body: Matter.Body, speed: number }[] = [];
+        const oscillatingPegs: { body: Matter.Body, initialPos: Matter.Vector, amplitude: Matter.Vector, frequency: number }[] = [];
+        const animatedCradles: { firstBob: Matter.Body, lastActivation: number, interval: number }[] = [];
+        const allWindZones: WindZoneController[] = [];
+
+        const topSectionEndY = 1000;
+        const obstacleLayers = [
+            { type: 'platforms', count: 25 * courseLengthMultiplier / 2 },
+            { type: 'spinners', count: 20 * courseLengthMultiplier / 2 },
+            { type: 'funnels', count: 8 * courseLengthMultiplier / 2 },
+            { type: 'plinko', count: 6 * courseLengthMultiplier / 2 },
+            { type: 'cradles', count: 8 * courseLengthMultiplier / 2 },
+            { type: 'flippers', count: 10 * courseLengthMultiplier / 2 },
+            { type: 'conveyors', count: 12 * courseLengthMultiplier / 2 }
+        ];
+
+        const totalTrackHeight = finishAreaStartY - topSectionEndY - 200;
+        const layerHeight = totalTrackHeight / obstacleLayers.length;
+        let currentY = topSectionEndY;
+        const existingObstacles: Matter.Body[] = [...ramps, ...finishPlatforms, rect];
+
+        obstacleLayers.forEach(layer => {
+            for (let i = 0; i < layer.count; i++) {
+                let bodiesToAdd: (Matter.Body | Matter.Constraint)[] = [];
+                let collisionCheckBody: Matter.Body | null = null;
+                let isColliding = true;
+                let attempts = 0;
+                const maxAttempts = 50;
+
+                do {
+                    const x = -wallXOffset + 200 + Math.random() * (viewWidth - 400);
+                    const y = currentY + Math.random() * layerHeight;
+                    
+                    switch (layer.type) {
+                         case 'platforms': {
+                            const width = 80 + Math.random() * 420;
+                            const trackCenter = dimensions.width / 2;
+                            const baseAngle = Math.random() * 0.4;
+                            const angle = x < trackCenter ? baseAngle : -baseAngle;
+                            const platform = Bodies.rectangle(x, y, width, 10, { isStatic: true, angle: angle, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
+                            collisionCheckBody = platform;
+                            bodiesToAdd = [platform];
+                            break;
+                        }
+                         case 'spinners': {
+                            const width = 70 + Math.random() * 230;
+                            const spinner = Bodies.rectangle(x, y, width, 8, { density: 0.00001, friction: 0, frictionAir: 0, render: { fillStyle: 'white' }, collisionFilter: { category: SPINNER_CATEGORY, mask: MARBLE_CATEGORY } });
+                            const pin = Constraint.create({ pointA: { x, y }, bodyB: spinner, stiffness: 1, length: 0 });
+                            collisionCheckBody = spinner;
+                            bodiesToAdd = [spinner, pin];
+                            break;
+                        }
+                        case 'funnels': {
+                            const funnelWidth = 150 + Math.random() * 250;
+                            const funnelHeight = 120 + Math.random() * 180;
+                            const wallThickness = 10;
+                            const funnelWallOptions = { isStatic: true, render: { fillStyle: 'white' } };
+                            const horizontalOffset = funnelWidth / 2.5;
+                            const leftFunnelWall = Bodies.rectangle(-horizontalOffset, 0, wallThickness, funnelHeight, { ...funnelWallOptions, angle: Math.PI / 6 });
+                            const rightFunnelWall = Bodies.rectangle(horizontalOffset, 0, wallThickness, funnelHeight, { ...funnelWallOptions, angle: -Math.PI / 6 });
+                            const funnelBody = Body.create({ parts: [leftFunnelWall, rightFunnelWall], isStatic: true, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
+                            Body.setPosition(funnelBody, { x, y });
+                            collisionCheckBody = funnelBody;
+                            bodiesToAdd = [funnelBody];
+                            break;
+                        }
+                        case 'plinko': {
+                            const rows = 5 + Math.floor(Math.random() * 5);
+                            const cols = 7 + Math.floor(Math.random() * 6);
+                            const pegRadius = 8;
+                            const spacingX = 50;
+                            const spacingY = 40;
+                            const pegOptions = { isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
+                            const tempPegs: Matter.Body[] = [];
+                            for (let row = 0; row < rows; row++) {
+                                for (let col = 0; col < cols; col++) {
+                                    const pegX = x - (cols * spacingX) / 2 + col * spacingX + (row % 2 === 1 ? spacingX / 2 : 0);
+                                    const pegY = y - (rows * spacingY) / 2 + row * spacingY;
+                                    const peg = Bodies.circle(pegX, pegY, pegRadius, pegOptions);
+                                    oscillatingPegs.push({ body: peg, initialPos: { x: pegX, y: pegY }, amplitude: { x: 10 + Math.random() * 20, y: 5 + Math.random() * 10 }, frequency: 0.001 + Math.random() * 0.002 });
+                                    tempPegs.push(peg);
+                                }
+                            }
+                            if (tempPegs.length > 0) {
+                                const bounds = Matter.Bounds.create(tempPegs.map(p => p.vertices));
+                                collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
+                                bodiesToAdd = tempPegs;
+                            }
+                            break;
+                        }
+                        case 'cradles': {
+                            const numBobs = 5;
+                            const bobRadius = 15;
+                            const ropeLength = 100;
+                            const cradleBobs: (Matter.Body | Matter.Constraint)[] = [];
+                            const tempParts: Matter.Body[] = [];
+                            for (let j = 0; j < numBobs; j++) {
+                                const bobX = x - (numBobs * bobRadius * 2) / 2 + bobRadius + j * bobRadius * 2;
+                                const bobY = y + ropeLength;
+                                const bob = Bodies.circle(bobX, bobY, bobRadius, { density: 0.1, restitution: 1, friction: 0, render: { fillStyle: 'white' }, collisionFilter: { category: DYNAMIC_OBSTACLE_CATEGORY, mask: MARBLE_CATEGORY | DYNAMIC_OBSTACLE_CATEGORY } });
+                                const rope = Constraint.create({ pointA: { x: bobX, y: y }, bodyB: bob, length: ropeLength, stiffness: 0.9 });
+                                cradleBobs.push(bob, rope);
+                                tempParts.push(bob);
+                            }
+                            if (tempParts.length > 0) {
+                                const firstBob = cradleBobs.find(item => 'type' in item && item.type === 'body') as Matter.Body;
+                                if (firstBob) {
+                                    animatedCradles.push({ firstBob: firstBob, lastActivation: 0, interval: 3000 + Math.random() * 4000 });
+                                }
+                                const bounds = Matter.Bounds.create(tempParts.map(p => p.vertices));
+                                collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
+                                bodiesToAdd = cradleBobs;
+                            }
+                            break;
+                        }
+                        case 'flippers': {
+                            const flipperWidth = 100 + Math.random() * 80;
+                            const flipperHeight = 15;
+                            const flipperGap = 10;
+                            const flipperOptions = { density: 0.1, render: { fillStyle: 'white' }, collisionFilter: { category: DYNAMIC_OBSTACLE_CATEGORY, mask: MARBLE_CATEGORY } };
+                            const leftFlipper = Bodies.rectangle(x - flipperWidth / 2 - flipperGap, y, flipperWidth, flipperHeight, { ...flipperOptions, angle: -0.3 });
+                            const rightFlipper = Bodies.rectangle(x + flipperWidth / 2 + flipperGap, y, flipperWidth, flipperHeight, { ...flipperOptions, angle: 0.3 });
+                            const leftPivot = { x: leftFlipper.position.x - flipperWidth / 2, y: y };
+                            const rightPivot = { x: rightFlipper.position.x + flipperWidth / 2, y: y };
+                            const leftConstraint = Constraint.create({ pointA: leftPivot, bodyB: leftFlipper, stiffness: 0.1 });
+                            const rightConstraint = Constraint.create({ pointA: rightPivot, bodyB: rightFlipper, stiffness: 0.1 });
+                            const flipperBodies = [leftFlipper, rightFlipper];
+                            const bounds = Matter.Bounds.create(flipperBodies.flatMap(f => f.vertices));
+                            collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
+                            bodiesToAdd = [leftFlipper, rightFlipper, leftConstraint, rightConstraint];
+                            break;
+                        }
+                        case 'conveyors': {
+                            const beltWidth = 200 + Math.random() * 300;
+                            const beltHeight = 15;
+                            const beltSpeed = Math.random() > 0.5 ? 2 : -2;
+                            const conveyorBody = Bodies.rectangle(x, y, beltWidth, beltHeight, { isStatic: true, render: { fillStyle: beltSpeed > 0 ? '#44DD44' : '#DD4444' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
+                            conveyorBelts.push({ body: conveyorBody, speed: beltSpeed });
+                            collisionCheckBody = conveyorBody;
+                            bodiesToAdd = [conveyorBody];
+                            break;
+                        }
+                    }
+                    isColliding = collisionCheckBody ? Query.collides(collisionCheckBody, existingObstacles).length > 0 : true;
+                    attempts++;
+                } while (isColliding && attempts < maxAttempts);
+
+                if (!isColliding && collisionCheckBody) {
+                    layeredObstacles.push(...bodiesToAdd);
+                    const bodiesOnly = bodiesToAdd.filter((item): item is Matter.Body => 'type' in item && item.type === 'body');
+                    existingObstacles.push(...bodiesOnly);
+                }
+            }
+
+            if (layer !== obstacleLayers[obstacleLayers.length - 1]) {
+                const separatorY = currentY + layerHeight;
+                const separator = Bodies.rectangle(dimensions.width / 2, separatorY, viewWidth, 5, {
+                    isSensor: true, isStatic: true, render: { fillStyle: 'rgba(255, 255, 255, 0.2)' }
+                });
+                layeredObstacles.push(separator);
+            }
+            currentY += layerHeight;
+        });
+
+        const mainWindZoneHeight = 600;
+        const mainWindZoneY = 200 + mainWindZoneHeight / 2;
+        const mainWindZoneXOffset = 250;
+        const initialMainWindZoneX = dimensions.width / 2 - mainWindZoneXOffset;
+        const mainWindZoneBody = Bodies.rectangle(initialMainWindZoneX, mainWindZoneY, 200, mainWindZoneHeight, { isSensor: true, isStatic: true, render: { strokeStyle: 'rgba(128, 128, 128, 0.5)', fillStyle: 'transparent', lineWidth: 1 }});
+        const mainIndicatorBody = Bodies.rectangle(initialMainWindZoneX, mainWindZoneY + mainWindZoneHeight / 2 + 25, 200, 50, { isStatic: true, render: { fillStyle: 'red' }, label: 'MainWindZoneIndicator' });
+        allWindZones.push({ body: mainWindZoneBody, indicator: mainIndicatorBody, force: { x: 0, y: -0.0005 } });
+
+        const worldComposite = Composite.create({ label: 'World' });
+        Composite.add(worldComposite, [
+            leftWall, rightWall, leftBorder, rightBorder, 
+            rect, rectConstraint, ...ramps,
+            ...layeredObstacles,
+            mainWindZoneBody, mainIndicatorBody,
+            ...finishPlatforms
+        ]);
+        
+        worldObjectsRef.current = {
+            worldComposite,
+            conveyorBelts,
+            oscillatingPegs,
+            animatedCradles,
+            allWindZones,
+            existingObstacles,
+            finishAreaStartY,
+            finalPlatformY,
+        };
+
+        World.add(engine.world, worldObjectsRef.current.worldComposite);
     }
 
-    // --- Create Finish Line - Plinko Style ---
-    const finishAreaStartY = currentCourseY + 100;
-    const finishPlatforms: Matter.Body[] = [];
-    const finishOptions = { isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
-    
-    let y = finishAreaStartY + 100;
-    const verticalSpacing = 250; // Increased spacing
-    const numPlatforms = 6;
-    const platformWidth = viewWidth * 0.9;
+    const engine = engineRef.current;
+    const render = renderRef.current;
+    const gl = glRef.current;
+    const glProgramData = glProgramDataRef.current;
 
-    for (let i = 0; i < numPlatforms; i++) {
-        const angle = 0.15;
-        let x;
-        let effectiveAngle;
-
-        if (i % 2 === 0) {
-            // Sloping down from the left
-            x = -wallXOffset + platformWidth / 2 - 50;
-            effectiveAngle = angle;
-        } else {
-            // Sloping down from the right
-            x = window.innerWidth + wallXOffset - platformWidth / 2 + 50;
-            effectiveAngle = -angle;
-        }
-        finishPlatforms.push(Bodies.rectangle(x, y, platformWidth, 20, { ...finishOptions, angle: effectiveAngle }));
-        y += verticalSpacing;
+    if (!engine || !render || !gl || !glProgramData || !worldObjectsRef.current) {
+        return;
     }
-
-    // Add a wall to the end of the second-to-last platform
-    const secondToLastPlatform = finishPlatforms[finishPlatforms.length - 1];
     
-    // The last sloping platform goes from right to left, so the 'end' is the left side.
-    const vertices = secondToLastPlatform.vertices;
-    const leftMostVertex = [...vertices].sort((a, b) => a.x - b.x)[0];
-
-    const finishWallHeight = 60;
-    const finishWallWidth = 20;
-
-    // Create a vertical wall at the leftmost point of the platform
-    const wall = Bodies.rectangle(
-        leftMostVertex.x + (finishWallWidth / 2),
-        leftMostVertex.y - (finishWallHeight / 2) + 10, // Adjust to sit nicely on the ramp
-        finishWallWidth,
-        finishWallHeight,
-        finishOptions
-    );
-    finishPlatforms.push(wall);
-
-    // Final platform to catch the marbles
-    const finalPlatformY = y + 100;
-    const finalPlatform = Bodies.rectangle(window.innerWidth / 2, finalPlatformY, viewWidth, 20, finishOptions);
-    finishPlatforms.push(finalPlatform);
-
-    // --- Create Walls, Borders, and Floor Dynamically ---
-    const wallHeight = finalPlatformY + 100; // Make sure it goes past the bottom platform
-    const wallOptions = {
-        isStatic: true, render: { visible: false }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
-    };
-    const leftWall = Bodies.rectangle(-wallXOffset - 50, wallHeight / 2, 100, wallHeight, wallOptions);
-    const rightWall = Bodies.rectangle(window.innerWidth + wallXOffset + 50, wallHeight / 2, 100, wallHeight, wallOptions);
-
-    const borderHeight = wallHeight;
-    const borderOptions = {
-        isStatic: true, render: { fillStyle: 'red' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY }
-    };
-    const leftBorder = Bodies.rectangle(-wallXOffset, borderHeight / 2, 2, borderHeight, borderOptions);
-    const rightBorder = Bodies.rectangle(window.innerWidth + wallXOffset, borderHeight / 2, 2, borderHeight, borderOptions);
-
-
-    // --- Create rectangle obstacle ---
-    const rect = Bodies.rectangle(window.innerWidth / 2, 200, 400, 10, {
-      isStatic: false,
-      density: 0.00001,
-      friction: 0,
-      frictionAir: 0,
-      render: {
-        fillStyle: 'white',
-      },
-      collisionFilter: {
-        category: SPINNER_CATEGORY,
-        mask: MARBLE_CATEGORY
-      }
-    });
-
-    const rectConstraint = Constraint.create({
-      pointA: { x: window.innerWidth / 2, y: 200 },
-      bodyB: rect,
-      stiffness: 1,
-      length: 0
-    });
-
-    // --- Create Layered Obstacles ---
-    const layeredObstacles: (Matter.Body | Matter.Constraint)[] = [];
-    const conveyorBelts: { body: Matter.Body, speed: number }[] = [];
-    const oscillatingPegs: { body: Matter.Body, initialPos: Matter.Vector, amplitude: Matter.Vector, frequency: number }[] = [];
-    const animatedCradles: { firstBob: Matter.Body, lastActivation: number, interval: number }[] = [];
-    const allWindZones: WindZoneController[] = [];
-
-    const topSectionEndY = 1000; // End of the custom top section
-
-    const obstacleLayers = [
-        { type: 'platforms', count: 25 * courseLengthMultiplier / 2 }, // Increased density
-        { type: 'spinners', count: 20 * courseLengthMultiplier / 2 }, // Increased density
-        { type: 'funnels', count: 8 * courseLengthMultiplier / 2 },   // Increased density
-        { type: 'plinko', count: 6 * courseLengthMultiplier / 2 },    // Increased density
-        { type: 'cradles', count: 8 * courseLengthMultiplier / 2 },   // Increased density
-        { type: 'flippers', count: 10 * courseLengthMultiplier / 2 }, // Increased density
-        { type: 'conveyors', count: 12 * courseLengthMultiplier / 2 }// Increased density
-    ];
-
-    const totalTrackHeight = finishAreaStartY - topSectionEndY - 200;
-    const layerHeight = totalTrackHeight / obstacleLayers.length;
-    let currentY = topSectionEndY;
-
-    // Start with the main ramps and finish line elements
-    const existingObstacles: Matter.Body[] = [...ramps, ...finishPlatforms, rect];
-
-    obstacleLayers.forEach(layer => {
-        for (let i = 0; i < layer.count; i++) {
-            let bodiesToAdd: (Matter.Body | Matter.Constraint)[] = [];
-            let collisionCheckBody: Matter.Body | null = null;
-            let isColliding = true;
-            let attempts = 0;
-            const maxAttempts = 50;
-
-            do {
-                const x = -wallXOffset + 200 + Math.random() * (viewWidth - 400);
-                const y = currentY + Math.random() * layerHeight;
-                
-                switch (layer.type) {
-                    case 'platforms': {
-                        const width = 80 + Math.random() * 420; // Increased size variation
-                        const trackCenter = window.innerWidth / 2;
-                        const baseAngle = Math.random() * 0.4;
-                        const angle = x < trackCenter ? baseAngle : -baseAngle;
-                        const platform = Bodies.rectangle(x, y, width, 10, { isStatic: true, angle: angle, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
-                        collisionCheckBody = platform;
-                        bodiesToAdd = [platform];
-                        break;
-                    }
-                    case 'spinners': {
-                        const width = 70 + Math.random() * 230; // Increased size variation
-                        const spinner = Bodies.rectangle(x, y, width, 8, { density: 0.00001, friction: 0, frictionAir: 0, render: { fillStyle: 'white' }, collisionFilter: { category: SPINNER_CATEGORY, mask: MARBLE_CATEGORY } });
-                        const pin = Constraint.create({ pointA: { x, y }, bodyB: spinner, stiffness: 1, length: 0 });
-                        collisionCheckBody = spinner;
-                        bodiesToAdd = [spinner, pin];
-                        break;
-                    }
-                    case 'funnels': {
-                        const funnelWidth = 150 + Math.random() * 250; // Increased size variation
-                        const funnelHeight = 120 + Math.random() * 180; // Increased size variation
-                        const wallThickness = 10;
-                        const wallOptions = { isStatic: true, render: { fillStyle: 'white' } };
-                        const horizontalOffset = funnelWidth / 2.5;
-                        const leftWall = Bodies.rectangle(-horizontalOffset, 0, wallThickness, funnelHeight, { ...wallOptions, angle: Math.PI / 6 });
-                        const rightWall = Bodies.rectangle(horizontalOffset, 0, wallThickness, funnelHeight, { ...wallOptions, angle: -Math.PI / 6 });
-                        const funnelBody = Body.create({ parts: [leftWall, rightWall], isStatic: true, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
-                        Body.setPosition(funnelBody, { x, y });
-                        collisionCheckBody = funnelBody;
-                        bodiesToAdd = [funnelBody];
-                        break;
-                    }
-                    case 'plinko': {
-                        const rows = 5 + Math.floor(Math.random() * 5); // Much larger
-                        const cols = 7 + Math.floor(Math.random() * 6); // Much larger
-                        const pegRadius = 8;
-                        const spacingX = 50;
-                        const spacingY = 40;
-                        const pegOptions = { isStatic: true, render: { fillStyle: 'white' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } };
-                        const tempPegs: Matter.Body[] = [];
-                        for (let row = 0; row < rows; row++) {
-                            for (let col = 0; col < cols; col++) {
-                                const pegX = x - (cols * spacingX) / 2 + col * spacingX + (row % 2 === 1 ? spacingX / 2 : 0);
-                                const pegY = y - (rows * spacingY) / 2 + row * spacingY;
-                                const peg = Bodies.circle(pegX, pegY, pegRadius, pegOptions);
-                                oscillatingPegs.push({
-                                    body: peg,
-                                    initialPos: { x: pegX, y: pegY },
-                                    amplitude: { x: 10 + Math.random() * 20, y: 5 + Math.random() * 10 },
-                                    frequency: 0.001 + Math.random() * 0.002
-                                });
-                                tempPegs.push(peg);
-                            }
-                        }
-                        if (tempPegs.length > 0) {
-                            const bounds = Matter.Bounds.create(tempPegs.map(p => p.vertices));
-                            collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
-                            bodiesToAdd = tempPegs;
-                        }
-                        break;
-                    }
-                    case 'cradles': {
-                        const numBobs = 5;
-                        const bobRadius = 15;
-                        const ropeLength = 100;
-                        const cradleBobs: (Matter.Body | Matter.Constraint)[] = [];
-                        const tempParts: Matter.Body[] = [];
-                        for (let j = 0; j < numBobs; j++) {
-                            const bobX = x - (numBobs * bobRadius * 2) / 2 + bobRadius + j * bobRadius * 2;
-                            const bobY = y + ropeLength;
-                            const bob = Bodies.circle(bobX, bobY, bobRadius, { density: 0.1, restitution: 1, friction: 0, render: { fillStyle: 'white' }, collisionFilter: { category: DYNAMIC_OBSTACLE_CATEGORY, mask: MARBLE_CATEGORY | DYNAMIC_OBSTACLE_CATEGORY } });
-                            const rope = Constraint.create({ pointA: { x: bobX, y: y }, bodyB: bob, length: ropeLength, stiffness: 0.9 });
-                            cradleBobs.push(bob, rope);
-                            tempParts.push(bob);
-                        }
-                        if (tempParts.length > 0) {
-                            const firstBob = cradleBobs.find(item => 'type' in item && item.type === 'body') as Matter.Body;
-                            if (firstBob) {
-                                animatedCradles.push({
-                                    firstBob: firstBob,
-                                    lastActivation: 0,
-                                    interval: 3000 + Math.random() * 4000 // Activate every 3-7 seconds
-                                });
-                            }
-                            const bounds = Matter.Bounds.create(tempParts.map(p => p.vertices));
-                            collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
-                            bodiesToAdd = cradleBobs;
-                        }
-                        break;
-                    }
-                    case 'flippers': {
-                        const flipperWidth = 100 + Math.random() * 80; // Increased size variation
-                        const flipperHeight = 15;
-                        const flipperGap = 10;
-                        const flipperOptions = { density: 0.1, render: { fillStyle: 'white' }, collisionFilter: { category: DYNAMIC_OBSTACLE_CATEGORY, mask: MARBLE_CATEGORY } };
-                        const leftFlipper = Bodies.rectangle(x - flipperWidth / 2 - flipperGap, y, flipperWidth, flipperHeight, { ...flipperOptions, angle: -0.3 });
-                        const rightFlipper = Bodies.rectangle(x + flipperWidth / 2 + flipperGap, y, flipperWidth, flipperHeight, { ...flipperOptions, angle: 0.3 });
-                        const leftPivot = { x: leftFlipper.position.x - flipperWidth / 2, y: y };
-                        const rightPivot = { x: rightFlipper.position.x + flipperWidth / 2, y: y };
-                        const leftConstraint = Constraint.create({ pointA: leftPivot, bodyB: leftFlipper, stiffness: 0.1 });
-                        const rightConstraint = Constraint.create({ pointA: rightPivot, bodyB: rightFlipper, stiffness: 0.1 });
-                        const flipperBodies = [leftFlipper, rightFlipper];
-                        const bounds = Matter.Bounds.create(flipperBodies.flatMap(f => f.vertices));
-                        collisionCheckBody = Bodies.rectangle((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2, bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, { isStatic: true });
-                        bodiesToAdd = [leftFlipper, rightFlipper, leftConstraint, rightConstraint];
-                        break;
-                    }
-                    case 'conveyors': {
-                        const beltWidth = 200 + Math.random() * 300; // Increased size variation
-                        const beltHeight = 15;
-                        const beltSpeed = Math.random() > 0.5 ? 2 : -2;
-                        const conveyorBody = Bodies.rectangle(x, y, beltWidth, beltHeight, { isStatic: true, render: { fillStyle: beltSpeed > 0 ? '#44DD44' : '#DD4444' }, collisionFilter: { category: WORLD_CATEGORY, mask: MARBLE_CATEGORY } });
-                        conveyorBelts.push({ body: conveyorBody, speed: beltSpeed });
-                        collisionCheckBody = conveyorBody;
-                        bodiesToAdd = [conveyorBody];
-                        break;
-                    }
-                }
-                isColliding = collisionCheckBody ? Query.collides(collisionCheckBody, existingObstacles).length > 0 : true;
-                attempts++;
-            } while (isColliding && attempts < maxAttempts);
-
-            if (!isColliding && collisionCheckBody) {
-                layeredObstacles.push(...bodiesToAdd);
-                const bodiesOnly = bodiesToAdd.filter((item): item is Matter.Body => 'type' in item && item.type === 'body');
-                existingObstacles.push(...bodiesOnly);
-            }
-        }
-
-        // Add separator platform at the end of each layer's vertical space
-        if (layer !== obstacleLayers[obstacleLayers.length - 1]) { // Don't add one after the last layer
-            const separatorY = currentY + layerHeight;
-            const separator = Bodies.rectangle(window.innerWidth / 2, separatorY, viewWidth, 5, {
-                isSensor: true,
-                isStatic: true,
-                render: {
-                    fillStyle: 'rgba(255, 255, 255, 0.2)'
-                }
-            });
-            layeredObstacles.push(separator);
-        }
-
-        currentY += layerHeight;
-    });
-
-    // --- Main Wind Zone (Now added separately at the top) ---
-    const mainWindZoneHeight = 600;
-    const mainWindZoneY = 200 + mainWindZoneHeight / 2;
-    const mainWindZoneXOffset = 250;
-    const initialMainWindZoneX = window.innerWidth / 2 - mainWindZoneXOffset;
-    const mainWindZoneBody = Bodies.rectangle(initialMainWindZoneX, mainWindZoneY, 200, mainWindZoneHeight, { isSensor: true, isStatic: true, render: { strokeStyle: 'rgba(128, 128, 128, 0.5)', fillStyle: 'transparent', lineWidth: 1 }});
-    const mainIndicatorBody = Bodies.rectangle(initialMainWindZoneX, mainWindZoneY + mainWindZoneHeight / 2 + 25, 200, 50, { isStatic: true, render: { fillStyle: 'red' } });
-    allWindZones.push({ body: mainWindZoneBody, indicator: mainIndicatorBody, force: { x: 0, y: -0.0005 } });
-
-
-    World.add(engine.world, [
-      leftWall, rightWall, leftBorder, rightBorder, 
-      rect, rectConstraint, ...ramps,
-      ...layeredObstacles,
-      mainWindZoneBody, mainIndicatorBody,
-      ...finishPlatforms
-    ]);
-
+    // --- Resize handler ---
+    render.options.width = dimensions.width;
+    render.options.height = dimensions.height;
+    metaballCanvas.width = dimensions.width;
+    metaballCanvas.height = dimensions.height;
+    matterCanvas.width = dimensions.width;
+    matterCanvas.height = dimensions.height;
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    
+    // --- Get generated data from refs ---
+    if (!worldObjectsRef.current) return;
+    const { conveyorBelts, oscillatingPegs, animatedCradles, allWindZones, existingObstacles, finishAreaStartY, finalPlatformY } = worldObjectsRef.current;
+    
     let ballInterval: NodeJS.Timeout | null = null;
     let stopSpawningTimeout: NodeJS.Timeout | null = null;
 
     const startSpawning = () => {
-        if (ballInterval) return; // Already started
+        if (ballInterval) return;
+        const zoom = 1.5;
+        const viewWidth = dimensions.width * zoom;
+        const wallXOffset = (viewWidth - dimensions.width) / 2;
+        
+        
         ballInterval = setInterval(() => {
       const isWater = Math.random() > 0.5;
-          const spawnPadding = 10;
-          const spawnX = -wallXOffset + spawnPadding + Math.random() * (viewWidth - spawnPadding * 2);
-          const spawnY = viewY.current - (window.innerHeight * zoom - window.innerHeight) / 2 - 50;
-      const initialRestitution = 0.85 + Math.random() * 0.1; // High but stable bounce
-      const ball = Bodies.circle(
-            spawnX, spawnY,
-        6 + Math.random() * 4,
-        { 
-              restitution: initialRestitution,
-              friction: 0,
-              frictionAir: 0.02 + Math.random() * 0.04,  // Air friction: 0.02 to 0.06
-              density: 0.0008 + Math.random() * 0.0004, // Mass: 0.0008 to 0.0012
-              label: isWater ? 'water' : 'lava',
-              collisionFilter: {
-                category: MARBLE_CATEGORY,
-                mask: WORLD_CATEGORY | SPINNER_CATEGORY | DYNAMIC_OBSTACLE_CATEGORY | MARBLE_CATEGORY
-              },
-              render: {
-                visible: false
-              }
-            }
-          );
-          (ball as any).initialRestitution = initialRestitution; // Store for dynamic adjustment
-          marbleTrails.current.set(ball.id, []);
-      World.add(engine.world, ball);
-    }, 2);
-
+            const spawnPadding = 10;
+            const spawnX = -wallXOffset + spawnPadding + Math.random() * (viewWidth - spawnPadding * 2);
+            const spawnY = viewY.current - (dimensions.height * zoom - dimensions.height) / 2 - 50;
+            const initialRestitution = 0.85 + Math.random() * 0.1;
+            const ball = Bodies.circle(spawnX, spawnY, 6 + Math.random() * 4, {
+                restitution: initialRestitution,
+                friction: 0,
+                frictionAir: 0.02 + Math.random() * 0.04,
+                density: 0.0008 + Math.random() * 0.0004,
+                label: isWater ? 'water' : 'lava',
+                collisionFilter: {
+                    category: MARBLE_CATEGORY,
+                    mask: WORLD_CATEGORY | SPINNER_CATEGORY | DYNAMIC_OBSTACLE_CATEGORY | MARBLE_CATEGORY
+                },
+                render: { visible: false }
+            });
+            (ball as any).initialRestitution = initialRestitution;
+            marbleTrails.current.set(ball.id, []);
+            World.add(engine.world, ball);
+        }, 2);
         stopSpawningTimeout = setTimeout(() => {
-          if (ballInterval) clearInterval(ballInterval);
+            if (ballInterval) clearInterval(ballInterval);
         }, 10000);
     };
 
-    const resize = () => {
-        if (!metaballCanvas || !matterCanvas || !gl || !render.options) return;
-
-        // Update canvas dimensions
-        metaballCanvas.width = window.innerWidth;
-        metaballCanvas.height = window.innerHeight;
-        matterCanvas.width = window.innerWidth;
-        matterCanvas.height = window.innerHeight;
-
-        // Update renderer dimensions
-        render.options.width = window.innerWidth;
-        render.options.height = window.innerHeight;
-
-        // Update WebGL viewport
-        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-
-        // Update camera to maintain view, which is crucial for preserving the scroll position
-        const newViewWidth = window.innerWidth * zoom;
-        const newViewHeight = window.innerHeight * zoom;
-        const newOffsetX = (newViewWidth - window.innerWidth) / 2;
-        const newOffsetY = (newViewHeight - window.innerHeight) / 2;
-        
-        Render.lookAt(render, {
-            min: { x: -newOffsetX, y: viewY.current - newOffsetY },
-            max: { x: window.innerWidth + newOffsetX, y: viewY.current + window.innerHeight + newOffsetY }
-        });
-    };
-
-    window.addEventListener('resize', resize);
-    resize();
-    
     const handleWheel = (e: WheelEvent) => {
       setCameraMode('disabled');
       setCameraTargetY(null);
@@ -685,10 +679,11 @@ const LavaLamp: React.FC = () => {
       const isRunning = isStartedRef.current;
       const speed = isRunning ? speedMultiplierRef.current : 1.0;
       
-      const viewWidth = window.innerWidth * zoom;
-      const viewHeight = window.innerHeight * zoom;
-      const offsetX = (viewWidth - window.innerWidth) / 2;
-      const offsetY = (viewHeight - window.innerHeight) / 2;
+      const zoom = 1.5;
+      const viewWidth = dimensions.width * zoom;
+      const viewHeight = dimensions.height * zoom;
+      const offsetX = (viewWidth - dimensions.width) / 2;
+      const offsetY = (viewHeight - dimensions.height) / 2;
 
       if (isRunning) {
         lastTime = time;
@@ -777,7 +772,7 @@ const LavaLamp: React.FC = () => {
         }
 
         if (cameraTargetYRef.current !== null) {
-            const targetViewY = cameraTargetYRef.current - window.innerHeight / 2;
+            const targetViewY = cameraTargetYRef.current - dimensions.height / 2;
             const smoothing = Math.min(1.0, 0.1 * Math.sqrt(speedMultiplierRef.current));
             viewY.current += (targetViewY - viewY.current) * smoothing;
         }
@@ -825,13 +820,16 @@ const LavaLamp: React.FC = () => {
       
       // --- ALWAYS-ON ANIMATIONS ---
       const currentTime = isRunning ? time : lastTime;
-      const centerX = window.innerWidth / 2;
-      const moveRange = mainWindZoneXOffset;
+      const centerX = dimensions.width / 2;
+      const moveRange = 250; 
       const newX = centerX + Math.cos(currentTime * 0.0002 * speed) * moveRange;
-      Body.setPosition(mainWindZoneBody, { x: newX, y: mainWindZoneBody.position.y });
-      Body.setPosition(mainIndicatorBody, { x: newX, y: mainIndicatorBody.position.y });
+      const mainWindZone = allWindZones.find(z => z.indicator.label === 'MainWindZoneIndicator');
+       if(mainWindZone) {
+          Body.setPosition(mainWindZone.body, { x: newX, y: mainWindZone.body.position.y });
+          Body.setPosition(mainWindZone.indicator, { x: newX, y: mainWindZone.indicator.position.y });
+       }
       
-      const randomWindZonesOnly = allWindZones.slice(1); // Exclude main wind zone
+      const randomWindZonesOnly = allWindZones.filter(z => z.indicator.label !== 'MainWindZoneIndicator');
       randomWindZonesOnly.forEach(zone => {
         const moveSpeed = 0.5 * speed;
         const velocity = Matter.Vector.mult(Matter.Vector.normalise(zone.force), moveSpeed);
@@ -866,9 +864,9 @@ const LavaLamp: React.FC = () => {
       });
 
       // --- Physics Culling (Sleeping) ---
-      const buffer = window.innerHeight; 
+      const buffer = dimensions.height; 
       const activeZoneTop = (viewY.current - offsetY) - buffer;
-      const activeZoneBottom = (viewY.current + window.innerHeight + offsetY) + buffer;
+      const activeZoneBottom = (viewY.current + dimensions.height + offsetY) + buffer;
 
       for (const body of Composite.allBodies(engine.world)) {
         if (body.isStatic) continue;
@@ -907,7 +905,7 @@ const LavaLamp: React.FC = () => {
       // --- RENDERING (always runs) ---
       Render.lookAt(render, {
         min: { x: -offsetX, y: viewY.current - offsetY },
-        max: { x: window.innerWidth + offsetX, y: viewY.current + window.innerHeight + offsetY }
+        max: { x: dimensions.width + offsetX, y: viewY.current + dimensions.height + offsetY }
       });
       
       const ctx = matterCanvas.getContext('2d');
@@ -984,7 +982,7 @@ const LavaLamp: React.FC = () => {
       }
 
 
-      const glContext = metaballCanvas.getContext('webgl');
+      const glContext = glRef.current;
       if (!glContext) {
         animationFrameId = requestAnimationFrame(renderLoop);
         return;
@@ -993,23 +991,23 @@ const LavaLamp: React.FC = () => {
       glContext.clearColor(0, 0, 0, 0);
       glContext.clear(glContext.COLOR_BUFFER_BIT);
 
-      glContext.useProgram(program);
+      glContext.useProgram(glProgramData.program);
 
-      glContext.enableVertexAttribArray(uniforms.positionAttributeLocation);
-      glContext.bindBuffer(glContext.ARRAY_BUFFER, positionBuffer);
-      glContext.vertexAttribPointer(uniforms.positionAttributeLocation, 2, glContext.FLOAT, false, 0, 0);
+      glContext.enableVertexAttribArray(glProgramData.uniforms.positionAttributeLocation as number);
+      glContext.bindBuffer(glContext.ARRAY_BUFFER, glProgramData.positionBuffer);
+      glContext.vertexAttribPointer(glProgramData.uniforms.positionAttributeLocation as number, 2, glContext.FLOAT, false, 0, 0);
 
-      glContext.uniform2f(uniforms.resolutionUniformLocation, glContext.canvas.width, glContext.canvas.height);
-      glContext.uniform1f(uniforms.timeUniformLocation, (isRunning ? time : lastTime) * 0.001);
+      glContext.uniform2f(glProgramData.uniforms.resolutionUniformLocation, glContext.canvas.width, glContext.canvas.height);
+      glContext.uniform1f(glProgramData.uniforms.timeUniformLocation, (isRunning ? time : lastTime) * 0.001);
       
       const allBodiesForRender = Composite.allBodies(engine.world);
       const circleBodiesForRender = allBodiesForRender.filter(body => body.circleRadius != null);
       const numMetaballs = Math.min(circleBodiesForRender.length, MAX_METABALLS);
 
-      glContext.uniform1i(uniforms.numMetaballsUniformLocation, numMetaballs);
+      glContext.uniform1i(glProgramData.uniforms.numMetaballsUniformLocation, numMetaballs);
 
       if (numMetaballs > 0) {
-          const data = new Float32Array(textureWidth * textureHeight * 4);
+          const data = new Float32Array(glProgramData.textureWidth * glProgramData.textureHeight * 4);
           const viewMinX = -offsetX;
           const viewMinY = viewY.current - offsetY;
 
@@ -1027,12 +1025,12 @@ const LavaLamp: React.FC = () => {
               data[i * 4 + 3] = isWater;
           }
           glContext.activeTexture(glContext.TEXTURE0);
-          glContext.bindTexture(glContext.TEXTURE_2D, metaballTexture);
-          glContext.texSubImage2D(glContext.TEXTURE_2D, 0, 0, 0, textureWidth, textureHeight, glContext.RGBA, glContext.FLOAT, data);
-          glContext.uniform1i(uniforms.metaballsTextureLocation, 0);
+          glContext.bindTexture(glContext.TEXTURE_2D, glProgramData.metaballTexture);
+          glContext.texSubImage2D(glContext.TEXTURE_2D, 0, 0, 0, glProgramData.textureWidth, glProgramData.textureHeight, glContext.RGBA, glContext.FLOAT, data);
+          glContext.uniform1i(glProgramData.uniforms.metaballsTextureLocation, 0);
       }
       
-      glContext.uniform2f(uniforms.textureDimensionsUniformLocation, textureWidth, textureHeight);
+      glContext.uniform2f(glProgramData.uniforms.textureDimensionsUniformLocation, glProgramData.textureWidth, glProgramData.textureHeight);
       glContext.drawArrays(glContext.TRIANGLES, 0, 6);
 
       animationFrameId = requestAnimationFrame(renderLoop);
@@ -1041,18 +1039,19 @@ const LavaLamp: React.FC = () => {
     renderLoop(0);
 
     return () => {
-        window.removeEventListener('resize', resize);
       window.removeEventListener('wheel', handleWheel);
         if (ballInterval) clearInterval(ballInterval);
       if (stopSpawningTimeout) clearTimeout(stopSpawningTimeout);
-        cancelAnimationFrame(animationFrameId);
-      Render.stop(render);
-        World.clear(engine.world, false);
-        Engine.clear(engine);
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+      
+      if (render) {
+        Render.stop(render);
+      }
+      // Don't clear engineRef and other refs here, as they should persist
         marbleTrails.current.clear();
         stuckMarblesTracker.current.clear();
     };
-  }, []);
+  }, [dimensions]);
 
   const getCameraModeText = () => {
     switch (cameraMode) {
