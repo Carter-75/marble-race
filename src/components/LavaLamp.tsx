@@ -905,6 +905,55 @@ const LavaLamp: React.FC = () => {
       const activeZoneTop = (viewY.current - offsetY) - buffer;
       const activeZoneBottom = (viewY.current + dimensions.height + offsetY) + buffer;
 
+      const allBodies = Composite.allBodies(engine.world);
+
+      const gridCellSize = 200;
+      const spatialGrid = new Map<string, Matter.Body[]>();
+
+      for (const body of allBodies) {
+        if (body.isStatic) continue;
+
+        const isInActiveZone = body.position.y >= activeZoneTop && body.position.y <= activeZoneBottom;
+        if (isInActiveZone) {
+          Sleeping.set(body, false);
+
+          const startX = Math.floor(body.bounds.min.x / gridCellSize);
+          const startY = Math.floor(body.bounds.min.y / gridCellSize);
+          const endX = Math.floor(body.bounds.max.x / gridCellSize);
+          const endY = Math.floor(body.bounds.max.y / gridCellSize);
+
+          for (let i = startX; i <= endX; i++) {
+              for (let j = startY; j <= endY; j++) {
+                  const key = `${i},${j}`;
+                  if (!spatialGrid.has(key)) {
+                      spatialGrid.set(key, []);
+                  }
+                  spatialGrid.get(key)!.push(body);
+              }
+          }
+
+        }
+      }
+
+      for (const cell of Array.from(spatialGrid.values())) {
+          for (let i = 0; i < cell.length; i++) {
+              for (let j = i + 1; j < cell.length; j++) {
+                  const bodyA = cell[i];
+                  const bodyB = cell[j];
+                  if (bodyA.isStatic || bodyB.isStatic) continue;
+
+                  // Custom broadphase check
+                  if (Matter.Bounds.overlaps(bodyA.bounds, bodyB.bounds)) {
+                      const collision = Matter.Collision.collides(bodyA, bodyB, undefined);
+                      if (collision && collision.collided) {
+                         // This is a simplified stand-in for a proper narrowphase + resolution
+                         // In a real scenario, you'd dispatch collision events here.
+                      }
+                  }
+              }
+          }
+      }
+
       for (const body of Composite.allBodies(engine.world)) {
         if (body.isStatic) continue;
 
