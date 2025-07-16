@@ -21,7 +21,7 @@ function debounce<F extends (...args: any[]) => any>(func: F, waitFor: number) {
 }
 
 
-const MAX_METABALLS = 1000000; 
+const MAX_METABALLS = 10000; 
 
 const vertexShaderSource = `
   attribute vec2 a_position;
@@ -203,6 +203,8 @@ const LavaLamp: React.FC = () => {
   const metaballCanvasRef = useRef<HTMLCanvasElement>(null);
   const matterCanvasRef = useRef<HTMLCanvasElement>(null);
   const viewY = useRef(0);
+  const marblesOnConveyors = useRef(new Map<number, Matter.Body[]>());
+
 
   useEffect(() => {
     const metaballCanvas = metaballCanvasRef.current;
@@ -603,6 +605,44 @@ const LavaLamp: React.FC = () => {
     let ballInterval: NodeJS.Timeout | null = null;
     let stopSpawningTimeout: NodeJS.Timeout | null = null;
 
+    const handleCollisionStart = (event: Matter.IEventCollision<Matter.Engine>) => {
+        event.pairs.forEach(pair => {
+            const { bodyA, bodyB } = pair;
+            const conveyor = conveyorBelts.find(c => c.body.id === bodyA.id || c.body.id === bodyB.id);
+            const marble = (conveyor?.body.id === bodyA.id) ? bodyB : bodyA;
+
+            if (conveyor && (marble.label === 'water' || marble.label === 'lava')) {
+                const marbles = marblesOnConveyors.current.get(conveyor.body.id) || [];
+                if (!marbles.includes(marble)) {
+                    marbles.push(marble);
+                    marblesOnConveyors.current.set(conveyor.body.id, marbles);
+                }
+            }
+        });
+    };
+
+    const handleCollisionEnd = (event: Matter.IEventCollision<Matter.Engine>) => {
+        event.pairs.forEach(pair => {
+            const { bodyA, bodyB } = pair;
+            const conveyor = conveyorBelts.find(c => c.body.id === bodyA.id || c.body.id === bodyB.id);
+            const marble = (conveyor?.body.id === bodyA.id) ? bodyB : bodyA;
+
+            if (conveyor && (marble.label === 'water' || marble.label === 'lava')) {
+                const marbles = marblesOnConveyors.current.get(conveyor.body.id);
+                if (marbles) {
+                    const index = marbles.indexOf(marble);
+                    if (index > -1) {
+                        marbles.splice(index, 1);
+                        marblesOnConveyors.current.set(conveyor.body.id, marbles);
+                    }
+                }
+            }
+        });
+    };
+
+    Matter.Events.on(engine, 'collisionStart', handleCollisionStart);
+    Matter.Events.on(engine, 'collisionEnd', handleCollisionEnd);
+
     const startSpawning = () => {
         if (ballInterval) return;
         const zoom = 1.5;
@@ -791,14 +831,11 @@ const LavaLamp: React.FC = () => {
 
         // --- Apply Conveyor Belt Force ---
         conveyorBelts.forEach(conveyor => {
-          const bounds = conveyor.body.bounds;
-          const marblesOnConveyor = Query.region(circleBodies, bounds);
-
-          marblesOnConveyor.forEach(marble => {
-              if (marble.circleRadius && Math.abs(marble.position.y - (bounds.min.y - marble.circleRadius)) < 5) {
-                  const force = { x: conveyor.speed * 0.001 * speed, y: 0 };
-                  Body.applyForce(marble, marble.position, force);
-              }
+          const marblesOnThisConveyor = marblesOnConveyors.current.get(conveyor.body.id) || [];
+          
+          marblesOnThisConveyor.forEach(marble => {
+              const force = { x: conveyor.speed * 0.001 * speed, y: 0 };
+              Body.applyForce(marble, marble.position, force);
           });
         });
 
@@ -1040,6 +1077,8 @@ const LavaLamp: React.FC = () => {
 
     return () => {
       window.removeEventListener('wheel', handleWheel);
+      Matter.Events.off(engine, 'collisionStart', handleCollisionStart);
+      Matter.Events.off(engine, 'collisionEnd', handleCollisionEnd);
         if (ballInterval) clearInterval(ballInterval);
       if (stopSpawningTimeout) clearTimeout(stopSpawningTimeout);
       if (animationFrameId) cancelAnimationFrame(animationFrameId);
@@ -1049,6 +1088,7 @@ const LavaLamp: React.FC = () => {
       }
       // Don't clear engineRef and other refs here, as they should persist
         marbleTrails.current.clear();
+        marblesOnConveyors.current.clear();
         stuckMarblesTracker.current.clear();
     };
   }, [dimensions]);
